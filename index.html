@@ -790,7 +790,7 @@ function fn(title, body){ return `<div class="fn"><b>${title}</b><span>${body}</
 
 /* ── state ──────────────────────────────────────────────────────────────── */
 const STEPS=["soil","hybrid","seed","nitrogen","water","budget"];
-let S={ view:"welcome", adminView:false, lastId:null, rolledFace:null, remote:null, remoteState:"off", name:"", group:"Student", tab:"yield", saved:false, rank:null, confirmClear:false,
+let S={ view:"welcome", adminView:false, lastId:null, rolledFace:null, remote:null, remoteState:"off", remoteError:"", name:"", group:"Student", tab:"yield", saved:false, rank:null, confirmClear:false,
   hybrid:MODEL.hybrids[Math.floor(MODEL.hybrids.length/2)].name,
   pop:30000, soilN:null, nPre:0, nSide:0, nFert:0,
   irr:{may:0,jun:0,jul:0,aug:0,sep:0,oct:0}, result:null };
@@ -994,9 +994,12 @@ function nitrogenScreen(){
       hint:"Comes in the pre-plant mix with phosphorus, worked in before the planter runs. The full package is 30 lb N /ac."})}
     ${dial({key:"nSide",label:"Side-dress",unit:"lb/ac",value:S.nSide,display:S.nSide,min:0,max:250,step:25,color:"var(--ink)",
       hint:"Knifed in beside the row when the corn is knee-high. Applied in 25 lb steps."})}
-    ${dial({key:"nFert",label:"Fertigation total",unit:"lb/ac",value:S.nFert,display:S.nFert,min:0,max:50,step:10,color:"var(--ink)",
-      hint:"Applied through the pivot in four passes across the season, at V8, VT/R1, R2 and R3."})}
-    ${fn("Soil N counts before anything you buy",
+    ${dial({key:"nFert",label:"Fertigation, season total",unit:"lb/ac",value:S.nFert,display:S.nFert,
+      min:0,max:160,step:10,color:"var(--ink)",
+      hint:"This is the total for the season, not the rate per pass. It is divided evenly across four "+
+           "fertigation events at V8, VT/R1, R2 and R3"+(S.nFert>0?", so "+(S.nFert/4).toFixed(1)+
+           " lb/ac goes on at each one":"")+"."})}
+${fn("Soil N counts before anything you buy",
       "What feeds the crop is residual soil nitrate plus the share of applied fertiliser it takes up. "+
       "In 2024 CSU-TAPS did not charge teams for nitrogen up to a combined 160 lb/ac counting initial "+
       "soil plus applied N, which is a fair guide to where the useful range sits. Across the field, "+
@@ -1203,7 +1206,7 @@ function boardScreen(){
 
   const src = S.remoteState==="ok"    ? `${all.length} entr${all.length===1?'y':'ies'} from every phone`
             : S.remoteState==="loading" ? `Checking the shared board. Showing ${all.length} from this device meanwhile.`
-            : S.remoteState==="error"   ? `Shared board unreachable. Showing ${all.length} from this device.`
+            : S.remoteState==="error"   ? `Shared board unreachable${S.remoteError?": "+S.remoteError:""}. Showing ${all.length} from this device.`
             : `${all.length} entr${all.length===1?'y':'ies'} on this device.`;
   const header = S.adminView
     ? `<div><div class="eyebrow">Booth view &middot; all participants</div>
@@ -1392,7 +1395,7 @@ function closeModal(){ modal.innerHTML=""; S.confirmClear=false; }
 
 /* ── input handling ─────────────────────────────────────────────────────── */
 const LIMITS={ pop:[MODEL.limits.pop[0],MODEL.limits.pop[1],1000],
-  nPre:[0,30,10], nSide:[0,250,25], nFert:[0,50,10] };
+  nPre:[0,30,10], nSide:[0,250,25], nFert:[0,160,10] };
 MONTHS.forEach(m=>LIMITS["irr."+m.key]=[0,m.max,0.5]);
 const getV=k=>k.startsWith("irr.")?S.irr[k.slice(4)]:S[k];
 const setV=(k,v)=>{ if(k.startsWith("irr.")) S.irr[k.slice(4)]=v; else S[k]=v; };
@@ -1449,29 +1452,57 @@ function pushRemote(entry){
     .catch(()=>{ /* the local copy is already saved, so a failure loses nothing */ });
 }
 
-const REMOTE_TIMEOUT = 6000;    // ms before we give up and show what we have
+/* Apps Script answers through a redirect to script.googleusercontent.com and
+   cold-starts on the first call of the day, so the first request can take a
+   while. Be patient, and try a second time before giving up. */
+const REMOTE_TIMEOUT = 15000;
+const REMOTE_RETRIES = 1;
 
-function pullRemote(){
+function pullRemote(force){
   if (!shareEnabled()){ S.remoteState = "off"; return; }
-  if (S.remoteState === "loading") return;      // one request at a time
+  // a manual refresh always goes through, even if a previous call is stuck
+  if (S.remoteState === "loading" && !force) return;
   S.remoteState = "loading";
+  S.remoteError = "";
 
-  // Without a timeout a stalled request leaves the board saying "Loading..."
-  // for ever. Give up after a few seconds and fall back to this device.
-  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
-  const timer = setTimeout(()=>{ if (ctl) ctl.abort(); }, REMOTE_TIMEOUT);
-  const done = (state, rows) => {
-    clearTimeout(timer);
-    if (rows) S.remote = rows;
-    S.remoteState = state;
-    if (S.view === "board") render();
+  const attempt = (tries) => {
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = setTimeout(()=>{ if (ctl) ctl.abort(); }, REMOTE_TIMEOUT);
+    const finish = (state, rows, why) => {
+      clearTimeout(timer);
+      if (rows) S.remote = rows;
+      S.remoteState = state;
+      S.remoteError = why || "";
+      if (S.view === "board") render();
+    };
+    fetch(SHARE_URL + "?all=1", ctl ? { method:"GET", signal: ctl.signal } : { method:"GET" })
+      .then(r => {
+        if (!r.ok) throw new Error("the sheet replied " + r.status);
+        return r.text();
+      })
+      .then(txt => {
+        let rows;
+        try { rows = JSON.parse(txt); }
+        catch(e){
+          // a sign-in page or a script error comes back as HTML, not JSON
+          throw new Error(/<html/i.test(txt)
+            ? "got a web page instead of data, so the deployment is probably not set to Anyone"
+            : "could not read the reply");
+        }
+        if (rows && rows.ok === false) throw new Error(rows.error || "the script reported an error");
+        finish("ok", Array.isArray(rows) ? rows : []);
+      })
+      .catch(err => {
+        const why = (err && err.name === "AbortError")
+          ? "the sheet did not answer in " + (REMOTE_TIMEOUT/1000) + " seconds"
+          : (err && err.message) || "could not reach the sheet";
+        if (tries > 0) { setTimeout(()=>attempt(tries-1), 700); return; }
+        finish("error", null, why);
+      });
   };
-
-  fetch(SHARE_URL + "?all=1", ctl ? { method:"GET", signal: ctl.signal } : { method:"GET" })
-    .then(r => r.json())
-    .then(rows => done("ok", Array.isArray(rows) ? rows : []))
-    .catch(() => done("error"));
+  attempt(REMOTE_RETRIES);
 }
+
 
 function postScore(){
   const r=S.result,c=r.cost;
@@ -1601,7 +1632,7 @@ document.addEventListener("click",e=>{
   if(el.dataset.hyb){ S.hybrid=el.dataset.hyb; render(); return; }
   if(el.dataset.tab){ S.tab=el.dataset.tab; render(); return; }
   if(el.dataset.bump){ const k=el.dataset.bump; setInput(k,getV(k)+parseInt(el.dataset.dir,10)*LIMITS[k][2]); return; }
-  if(el.id==="refreshBtn"){ pullRemote(); render(); return; }
+  if(el.id==="refreshBtn"){ pullRemote(true); render(); return; }
   if(el.dataset.go){
     const g=el.dataset.go;
     if(g==="result"){ openConfirm(); return; }        // ask before locking it in
@@ -1643,4 +1674,3 @@ render();
 </script>
 </body>
 </html>
-
